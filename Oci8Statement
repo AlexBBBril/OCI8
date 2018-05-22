@@ -1,0 +1,309 @@
+<?php
+
+declare(strict_types=1);
+
+namespace Oci8;
+
+
+use Oci8\Exception\Oci8Exception;
+
+class Oci8Statement
+{
+    /**
+     * @var resource Database Handle
+     */
+    protected $_dbh;
+
+    /**
+     * @var resource Statement Handle
+     */
+    protected $_sth;
+
+    /**
+     * @var Oci8Connection соединение с базой данных Oracle
+     */
+    protected $_conn;
+
+    /**
+     * Удерживает ссылки на связанные значения параметров.
+     *
+     * Это новое требование для расширения oci8 PHP7, которое предотвращает привязанные значения от сбора мусора.
+     *
+     * @var array
+     */
+    private $boundValues = [];
+
+    /**
+     * Указывает, находится ли оператор в состоянии, когда выборки возможны
+     *
+     * @var bool
+     */
+    private $result = false;
+
+    /**
+     * @var int
+     */
+    protected $_defaultFetchMode = \PDO::FETCH_BOTH;
+
+    /**
+     * @var array
+     */
+    protected static $fetchModeMap = [
+        \PDO::FETCH_BOTH   => OCI_BOTH,
+        \PDO::FETCH_ASSOC  => OCI_ASSOC,
+        \PDO::FETCH_NUM    => OCI_NUM,
+        \PDO::FETCH_COLUMN => OCI_NUM,
+    ];
+
+    /**
+     * Создает новый OCI8Statement, который использует данный дескриптор соединения и инструкцию SQL.
+     *
+     * @param resource       $dbh       The Database connection handle.
+     * @param string         $statement The SQL statement.
+     * @param Oci8Connection $conn
+     */
+    public function __construct($dbh, string $statement, Oci8Connection $conn)
+    {
+        $this->_sth  = oci_parse($dbh, $statement);
+        $this->_dbh  = $dbh;
+        $this->_conn = $conn;
+    }
+
+    /**
+     * Привязывает значение к соответствующему имени или плейсхолдеру в выражении SQL,
+     * которое использовалось для подготовки выражения.
+     *
+     * @param mixed $param Идентификатор параметра. Для подготовленного выражения с использованием именованных плесхолдеров имеющие форму :name
+     * @param mixed $value Значение для привязки к параметру
+     * @param int   $type  Тип данных параметра в виде PDO констант
+     *
+     * @return bool TRUE при успехе или FALSE при неудаче.
+     */
+    public function bindValue($param, $value, $type = \PDO::PARAM_STR): bool
+    {
+        return $this->bindParam($param, $value, $type, null);
+    }
+
+    /**
+     * Привязывает переменную PHP к соответствующему заполнителю имени или плейсхолдеру в выражении SQL,
+     * который использовался для подготовки выражения.
+     * Переменная привязана как ссылка и будет оцениваться только в момент вызова Oci8Statement->execute().
+     *
+     * @param mixed $column   Идентификатор параметра. Для подготовленного выражения с использованием именованных плесхолдеров имеющие форму :name
+     * @param mixed $variable Имя переменной для привязки к SQL выражению
+     * @param int   $type     Тип данных параметра в виде PDO констант
+     * @param null  $length   Максимальная длина стандартного выходного потока при использовании привязки OUT, чтобы PHP выделял достаточно памяти для хранения возвращаемого значения.
+     *
+     * @return bool TRUE при успехе или FALSE при неудаче.
+     */
+    public function bindParam($column, &$variable, $type = \PDO::PARAM_STR, $length = null): bool
+    {
+        if ($type === \PDO::PARAM_LOB) {
+            $variable = oci_new_descriptor($this->_dbh, OCI_DTYPE_LOB);
+            $this->boundValues[$column] =& $variable;
+
+            return oci_bind_by_name($this->_sth, $column, $variable, -1, OCI_B_CLOB);
+        }
+
+        if ($length !== null) {
+            $this->boundValues[$column] =& $variable;
+
+            return oci_bind_by_name($this->_sth, $column, $variable, $length);
+        }
+
+        $this->boundValues[$column] =& $variable;
+
+        return oci_bind_by_name($this->_sth, $column, $variable);
+    }
+
+    /**
+     * Выполняет подготовленное выражение
+     *
+     * Если подготовленное выражение включает маркеры параметров, необходимо либо вызвать Oci8Statement->bindParam(),
+     * чтобы привязать переменные PHP к маркерам параметров,
+     * либо передайте массив значений параметров.
+     *
+     * @param array $params Массив значений с таким количеством элементов, сколько передано в SQL выражение для привязки
+     *
+     * @return bool TRUE при успехе или FALSE при неудаче.
+     * @throws Oci8Exception
+     */
+    public function execute(array $params = []): bool
+    {
+        if (!empty($params)) {
+            $hasZeroIndex = array_key_exists(0, $params);
+            foreach ($params as $key => $val) {
+                if ($hasZeroIndex && is_numeric($key)) {
+                    $this->bindValue($key + 1, $val);
+                } else {
+                    $this->bindValue($key, $val);
+                }
+            }
+        }
+
+        $ret = @oci_execute($this->_sth, $this->_conn->getExecuteMode());
+        if (!$ret) {
+            throw Oci8Exception::fromErrorInfo($this->errorInfo());
+        }
+
+        $this->result = true;
+
+        return $ret;
+    }
+
+    /**
+     * Возвращает слудующую строку в результирующем наборе
+     *
+     * @param null $fetchMode Управляет тем, как следующая строка будет возвращена.
+     *                        Значение должно быть одной из констант PDO FetchMode, по умолчанию PDO::FETCH_BOTH
+     *
+     * @return mixed Возвращаемое значение этого метода при успешном выполнении зависит от режима выборки.
+     *               Во всех случаях FALSE возвращается при ошибке.
+     *
+     * @throws \InvalidArgumentException
+     */
+    public function fetch($fetchMode = null)
+    {
+        if (!$this->result) {
+            return false;
+        }
+
+        $fetchMode = $fetchMode ?: $this->_defaultFetchMode;
+
+        if ($fetchMode === \PDO::FETCH_COLUMN) {
+            return $this->fetchColumn();
+        }
+
+        if ($fetchMode === \PDO::FETCH_OBJ) {
+            return oci_fetch_object($this->_sth);
+        }
+
+        if (!isset(self::$fetchModeMap[$fetchMode])) {
+            throw new \InvalidArgumentException('Invalid fetch style: '.$fetchMode);
+        }
+
+        return oci_fetch_array(
+            $this->_sth,
+            self::$fetchModeMap[$fetchMode] | OCI_RETURN_NULLS | OCI_RETURN_LOBS
+        );
+    }
+
+    /**
+     * Возвращает массив, содержащий все строки результирующего набора
+     *
+     * @param int|null $fetchMode  Управляет тем, как следующая строка будет возвращена.
+     *                             Значение должно быть одной из констант PDO FetchMode, по умолчанию PDO::FETCH_BOTH
+     *
+     * @return array
+     *
+     * @throws \InvalidArgumentException
+     */
+    public function fetchAll($fetchMode = null): array
+    {
+        $fetchMode = $fetchMode ?: $this->_defaultFetchMode;
+
+        $result = [];
+
+        if ($fetchMode === \PDO::FETCH_OBJ) {
+            while ($row = $this->fetch($fetchMode)) {
+                $result[] = $row;
+            }
+
+            return $result;
+        }
+
+        if (!isset(self::$fetchModeMap[$fetchMode])) {
+            throw new \InvalidArgumentException('Invalid fetch style: '.$fetchMode);
+        }
+
+        if (self::$fetchModeMap[$fetchMode] === OCI_BOTH) {
+            while ($row = $this->fetch($fetchMode)) {
+                $result[] = $row;
+            }
+        } else {
+            $fetchStructure = OCI_FETCHSTATEMENT_BY_ROW;
+
+            if ($fetchMode === \PDO::FETCH_COLUMN ) {
+                $fetchStructure = OCI_FETCHSTATEMENT_BY_COLUMN;
+            }
+
+            if (!$this->result) {
+                return [];
+            }
+
+            oci_fetch_all(
+                $this->_sth,
+                $result,
+                0,
+                -1,
+                self::$fetchModeMap[$fetchMode] | OCI_RETURN_NULLS | $fetchStructure | OCI_RETURN_LOBS
+            );
+
+            if ($fetchMode === \PDO::FETCH_COLUMN ) {
+                $result = $result[0];
+            }
+        }
+
+        return $result;
+    }
+
+    /**
+     * Возвращает единственный столбец из следующей строки результирующего набора или FALSE, если строк больше нет.
+     *
+     * @param int $columnIndex Индексный номер столбца, для извлечения из строки.
+     *                         Если значение не указано, Oci8Statement->fetchColumn() извлекает первый столбец.
+     *
+     * @return string|boolean Единственный столбец в следующей строке результирующего набора или FALSE, если строк больше нет.
+     */
+    public function fetchColumn($columnIndex = 0)
+    {
+        // не пытайтесь извлечь из инструкции, если она не должна содержать результат
+        // в целях предотвращения исключительной ситуации
+        if (!$this->result) {
+            return false;
+        }
+
+        $row = oci_fetch_array($this->_sth, OCI_NUM | OCI_RETURN_NULLS | OCI_RETURN_LOBS);
+
+        if (false === $row) {
+            return false;
+        }
+
+        return $row[$columnIndex] ?? null;
+    }
+
+    /**
+     * @return array
+     */
+    public function errorInfo(): array
+    {
+        return oci_error($this->_sth);
+    }
+
+    /**
+     * Возвращает содержимое объекта LOB
+     *
+     * @param mixed $clob
+     *
+     * @return mixed
+     * @throws \App\Component\Oci8\Exception\Oci8Exception
+     */
+    public function loadClob($clob)
+    {
+        $response = $clob->load();
+        if ('' === $response) {
+            throw Oci8Exception::emptyResult();
+        }
+        $clob->free();
+
+        return $response;
+    }
+
+    /**
+     * Освобождает ресурсы, занимаемые курсором или SQL-выражением
+     */
+    public function freeStatement(): void
+    {
+        oci_free_statement($this->_sth);
+    }
+}
