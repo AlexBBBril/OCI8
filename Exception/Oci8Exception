@@ -1,0 +1,43 @@
+<?php
+
+declare(strict_types=1);
+
+namespace Oci8\Exception;
+
+
+class Oci8Exception extends \Exception
+{
+    /**
+     * @return Oci8Exception
+     */
+    public static function invalidJson(): self
+    {
+        return new self('Передан некорректный JSON-объект');
+    }
+
+    /**
+     * @param array $error
+     *
+     * @return Oci8Exception
+     */
+    public static function fromErrorInfo($error): self
+    {
+        return new self('. Error message: '.$error['message'] . '. Error code: '.$error['code']);
+    }
+
+    /**
+     * @return Oci8Exception
+     */
+    public static function notExistConnection(): self
+    {
+        return new self('Соединение с базой данных не инициализорованно.');
+    }
+
+    /**
+     * @return Oci8Exception
+     */
+    public static function emptyResult(): self
+    {
+        return new self('Запрос выполнен без результата');
+    }
+}
